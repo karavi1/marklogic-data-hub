@@ -190,6 +190,7 @@ declare function merge-impl:save-merge-models-by-uri(
     xdmp:log("Skipping merge because all uris to be merged (" || fn:string-join($uris, ", ") ||
       ") were already write-locked", "debug")
   else
+    let $start-elapsed := xdmp:elapsed-time()
     let $merge-options :=
       if ($merge-options instance of object-node()) then
         merge-impl:options-from-json($merge-options)
@@ -257,8 +258,10 @@ declare function merge-impl:save-merge-models-by-uri(
             for $uri in $distinct-uris
             return map:entry($uri, xdmp:document-get-collections($uri)[fn:not(. = $const:ARCHIVED-COLL)])
           )),$on-merge-options)
-        )
-
+        ),
+        if (xdmp:trace-enabled($const:TRACE-PERFORMANCE)) then
+          xdmp:trace($const:TRACE-PERFORMANCE, "merge-impl:save-merge-models-by-uri: " || (xdmp:elapsed-time() - $start-elapsed))
+        else ()
     )
 };
 
@@ -479,6 +482,7 @@ declare function merge-impl:build-merge-models-by-uri(
   $id as xs:string
 )
 {
+  let $start-elapsed := xdmp:elapsed-time()
   let $expanded-uris :=
     fn:distinct-values(
       for $uri in $uris
@@ -509,7 +513,7 @@ declare function merge-impl:build-merge-models-by-uri(
                 else
                   $const:FORMAT-JSON
   let $merge-uri := merge-impl:build-merge-uri($id, $format)
-  return
+  return (
     map:map()
       => map:with("audit-trace",
           auditing:build-audit-trace(
@@ -533,7 +537,11 @@ declare function merge-impl:build-merge-models-by-uri(
             $headers-ns-map,
             $merge-options
           )
-        )
+        ),
+        if (xdmp:trace-enabled($const:TRACE-PERFORMANCE)) then
+          xdmp:trace($const:TRACE-PERFORMANCE, "merge-impl:build-merge-models-by-uri: " || (xdmp:elapsed-time() - $start-elapsed))
+        else ()
+    )
 };
 
 (:
@@ -611,6 +619,7 @@ declare function merge-impl:build-merge-models-by-final-properties-to-xml(
         $final-triples
       }</es:triples>
       <es:instance>{
+        fn:head($docs)/es:envelope/es:instance/es:info,
         merge-impl:build-instance-body-by-final-properties(
           $final-properties,
           $wrapper-qnames,
@@ -1014,10 +1023,21 @@ declare function merge-impl:build-merge-models-by-final-properties-to-json(
         "triples": array-node {
           $final-triples
         },
-        "instance": merge-impl:build-instance-body-by-final-properties(
-          $final-properties,
-          $wrapper-qnames,
-          $const:FORMAT-JSON
+        "instance": (
+          let $instance-body :=
+            merge-impl:build-instance-body-by-final-properties(
+              $final-properties,
+              $wrapper-qnames,
+              $const:FORMAT-JSON
+            )
+          let $info := fn:head($docs)/envelope/instance/info
+          return
+            if (fn:exists($info)) then
+              object-node{
+                "info": $info
+              } + $instance-body
+            else
+              $instance-body
         )
       }
     }
@@ -1264,7 +1284,7 @@ declare function merge-impl:get-sources(
   for $doc in $docs
   let $sources := $doc/(es:envelope|object-node("envelope"))
       /(es:headers|object-node("headers"))
-      /(*:sources/(*:source|*:name)|array-node("sources")/object-node("sources")|object-node("sources"))
+      /(*:sources/(*:source|*:name)[self::element()]|array-node("sources")/object-node("sources")|object-node("sources"))
   let $sources := if (fn:empty($sources)) then object-node { "name": xdmp:node-uri($doc) } else $sources
   for $source in $sources
   let $last-updated :=
@@ -1713,6 +1733,11 @@ declare function merge-impl:build-final-properties(
   $target-entity
 ) as map:map*
 {
+  let $sources-by-document-uri :=
+    map:new(
+      for $doc-uri in $sources/documentUri
+      return map:entry($doc-uri, $doc-uri/..)
+    )
   let $entity-definition := es-helper:get-entity-def($target-entity)
   let $entity-def-namespace := $entity-definition/namespaceUri
   let $top-level-properties :=
@@ -1776,7 +1801,7 @@ declare function merge-impl:build-final-properties(
             $source-details/sourceLocation
           else:)
         merge-impl:node-uri($doc)
-      let $prop-sources := $sources[documentUri = $lineage-uris]
+      let $prop-sources := $lineage-uris ! map:get($sources-by-document-uri, .)
       where fn:exists($props-for-instance)
       return
         merge-impl:wrap-revision-info($prop-qname, $prop-value, $prop-sources, $path-prop/@path, $ns-map)
@@ -1960,7 +1985,7 @@ declare function merge-impl:build-final-properties(
                 $source-details/sourceLocation
               else:)
             merge-impl:node-uri($doc)
-          let $prop-sources := $sources[documentUri = $lineage-uris]
+          let $prop-sources := $lineage-uris ! map:get($sources-by-document-uri, .)
           let $_trace :=
             if (xdmp:trace-enabled($const:TRACE-MERGE-RESULTS)) then
               xdmp:trace($const:TRACE-MERGE-RESULTS, xdmp:describe(('Doc', $doc , 'Properties for doc', $props-for-instance),(),()))
@@ -2337,8 +2362,9 @@ declare function merge-impl:options-to-json($options-xml as element(merging:opti
                     "collections",
                     map:new(
                       for $event in $options-xml/merging:algorithms/merging:collections/*
+                      let $json := merge-impl:collection-event-to-json($event)
                       return
-                        merge-impl:collection-event-to-json($event)
+                        map:entry(fn:string(fn:node-name($json)), $json)
                     )
                   )
                 else ()
@@ -2536,7 +2562,7 @@ declare private function merge-impl:construct-merging-element($options-json as o
       => map:with("camel-case", fn:true())
       => map:with("whitespace", "ignore")
       => map:with("array-element-names", $array-element-names)
-      => map:with("attribute-names", ("name", "weight", "strategy", "propertyName", "algorithmRef", "maxValues", "maxSources", "documentUri"))
+      => map:with("attribute-names", ("default", "name", "weight", "strategy", "propertyName", "algorithmRef", "maxValues", "maxSources", "documentUri"))
     let $all-xml := (
       for $merge in $options-json/*:options/*:merging
       return
